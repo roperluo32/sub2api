@@ -1,0 +1,101 @@
+name: Build and deploy custom image
+
+on:
+  push:
+    branches:
+      - custom/sig-ubuntu-02
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: Deploy after building the image
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/sub2api
+  DEPLOY_INFO_REPOSITORY: roperluo32/api-deploy-info
+  DEPLOY_SERVICE_DIR: services/sub2api/production
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      image_ref: ${{ steps.image.outputs.image_ref }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare image metadata
+        id: image
+        run: |
+          owner="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          image_name="ghcr.io/${owner}/sub2api"
+          short_sha="${GITHUB_SHA::12}"
+          echo "image_name=${image_name}" >> "$GITHUB_OUTPUT"
+          echo "image_ref=${image_name}:custom-${short_sha}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${short_sha}" >> "$GITHUB_OUTPUT"
+          echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ steps.image.outputs.image_ref }}
+            ${{ steps.image.outputs.image_name }}:custom-sig-ubuntu-02
+          build-args: |
+            VERSION=custom-${{ steps.image.outputs.short_sha }}
+            COMMIT=${{ github.sha }}
+            DATE=${{ steps.image.outputs.build_date }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build
+    if: ${{ github.event_name == 'push' || inputs.deploy }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout deploy info
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.DEPLOY_INFO_REPOSITORY }}
+          token: ${{ secrets.DEPLOY_INFO_REPO_TOKEN }}
+          path: deploy-info
+
+      - name: Configure SSH
+        env:
+          DEPLOY_SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+      - name: Deploy to recorded host
+        env:
+          IMAGE_REF: ${{ needs.build.outputs.image_ref }}
+          GHCR_USERNAME: ${{ github.repository_owner }}
+          GHCR_TOKEN: ${{ secrets.GHCR_READ_TOKEN || secrets.GITHUB_TOKEN }}
+          SSH_KEY_PATH: ~/.ssh/deploy_key
+        run: |
+          bash deploy-info/scripts/deploy-compose.sh \
+            "deploy-info/${DEPLOY_SERVICE_DIR}" \
+            "${IMAGE_REF}"
